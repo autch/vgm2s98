@@ -1,0 +1,381 @@
+#!/usr/bin/env python3
+"""vgm2s98 - Convert VGM files to S98 V3 format.
+
+Converts the OPNA/OPN-compatible portion of a VGM log into an S98 file
+playable on real PC-98 hardware (or any S98 player).
+
+Supported VGM chips:
+  YM2608 (0x56/0x57)      -> S98 OPNA device (normal/extend), 1:1
+  YM2203 (0x55)           -> S98 OPN device, 1:1
+  AY8910/YM2149 (0xA0)    -> S98 PSG device
+
+Everything else (YM2612, SN76489, DAC streams, data blocks, ...) is
+skipped; a summary of skipped commands is printed.
+
+Timing: VGM waits are counted in 44100 Hz samples. They are converted to
+the S98 sync unit (default 1/1000 s) with running-total quantization, so
+the error never accumulates: at any point the emitted sync count equals
+floor(elapsed_samples * sync_rate / 44100).
+
+The VGM loop offset is mapped to the S98 loop point. GD3 tags are
+converted to an [S98] tag (UTF-8 with BOM) appended at the end of file,
+as recommended by the S98 V3 spec.
+"""
+
+import argparse
+import gzip
+import struct
+import sys
+
+VGM_SAMPLE_RATE = 44100
+
+# S98 device type ids
+S98_OPN = 2
+S98_OPNA = 4
+S98_PSG_YM2149 = 1
+S98_PSG_AY8910 = 15
+
+# Default chip clocks used when the VGM header field is absent/zero
+DEFAULT_CLOCKS = {"ym2608": 7987200, "ym2203": 3993600, "ay8910": 1789750}
+
+
+class VgmError(Exception):
+    pass
+
+
+def read_vgm(path):
+    """Read a .vgm or .vgz (gzip) file."""
+    with open(path, "rb") as f:
+        head = f.read(2)
+        f.seek(0)
+        if head == b"\x1f\x8b":
+            with gzip.open(f) as g:
+                return g.read()
+        return f.read()
+
+
+def u32(data, ofs):
+    return struct.unpack_from("<L", data, ofs)[0]
+
+
+def parse_header(data):
+    if data[0:4] != b"Vgm ":
+        raise VgmError("not a VGM file (bad magic)")
+    version = u32(data, 0x08)
+
+    if version >= 0x150 and u32(data, 0x34) != 0:
+        data_ofs = 0x34 + u32(data, 0x34)
+    else:
+        data_ofs = 0x40
+
+    loop_ofs = u32(data, 0x1C)
+    loop_abs = 0x1C + loop_ofs if loop_ofs else None
+    gd3_ofs = u32(data, 0x14)
+    gd3_abs = 0x14 + gd3_ofs if gd3_ofs else None
+
+    def clock(field_ofs):
+        # Header fields only exist if the data offset leaves room for them
+        if field_ofs + 4 <= data_ofs and field_ofs + 4 <= len(data):
+            return u32(data, field_ofs) & 0x3FFFFFFF  # mask dual-chip flags
+        return 0
+
+    ay_type = data[0x78] if 0x79 <= data_ofs and len(data) > 0x78 else 0
+
+    return {
+        "version": version,
+        "data_ofs": data_ofs,
+        "loop_abs": loop_abs,
+        "gd3_abs": gd3_abs,
+        "total_samples": u32(data, 0x18),
+        "clock_ym2608": clock(0x48),
+        "clock_ym2203": clock(0x44),
+        "clock_ay8910": clock(0x74),
+        "ay_type": ay_type,
+    }
+
+
+def parse_gd3(data, ofs):
+    """Return the GD3 tag as a list of 11 strings, or None."""
+    if ofs is None or data[ofs:ofs + 4] != b"Gd3 ":
+        return None
+    length = u32(data, ofs + 8)
+    payload = data[ofs + 12:ofs + 12 + length]
+    fields = payload.decode("utf-16-le", errors="replace").split("\x00")
+    return (fields + [""] * 11)[:11]
+
+
+# Byte length (including the command byte) of VGM commands we skip.
+# Documented reserved ranges are included so unknown-chip files still parse.
+def skip_len(cmd):
+    if 0x30 <= cmd <= 0x3F:
+        return 2
+    if 0x40 <= cmd <= 0x4E:
+        return 3
+    if cmd in (0x4F, 0x50):
+        return 2
+    if 0x51 <= cmd <= 0x5F:
+        return 3
+    if cmd == 0x64:
+        return 4
+    if 0x70 <= cmd <= 0x8F:
+        return 1        # 0x7n/0x8n also carry a wait, handled by caller
+    if cmd == 0x90 or cmd == 0x91:
+        return 5
+    if cmd == 0x92:
+        return 6
+    if cmd == 0x93:
+        return 11
+    if cmd == 0x94:
+        return 2
+    if cmd == 0x95:
+        return 5
+    if 0xA0 <= cmd <= 0xBF:
+        return 3
+    if 0xC0 <= cmd <= 0xDF:
+        return 4
+    if 0xE0 <= cmd <= 0xFF:
+        return 5
+    return None
+
+
+def parse_commands(data, hdr):
+    """Walk the VGM command stream.
+
+    Returns (events, used_chips, skipped) where events is a list of
+    ('write', chip, port, addr, value) / ('wait', samples) / ('loop',).
+    """
+    events = []
+    used = set()
+    skipped = {}
+    pos = hdr["data_ofs"]
+    loop_abs = hdr["loop_abs"]
+    end = len(data)
+
+    def skip_count(name):
+        skipped[name] = skipped.get(name, 0) + 1
+
+    while pos < end:
+        if loop_abs is not None and pos == loop_abs:
+            events.append(("loop",))
+            loop_abs = None
+        cmd = data[pos]
+
+        if cmd == 0x66:                     # end of sound data
+            break
+        elif cmd == 0x55:                   # YM2203
+            events.append(("write", "ym2203", 0, data[pos + 1], data[pos + 2]))
+            used.add("ym2203")
+            pos += 3
+        elif cmd == 0x56 or cmd == 0x57:    # YM2608 port 0/1
+            events.append(("write", "ym2608", cmd - 0x56,
+                           data[pos + 1], data[pos + 2]))
+            used.add("ym2608")
+            pos += 3
+        elif cmd == 0xA0:                   # AY8910 (bit7 of addr = 2nd chip)
+            addr = data[pos + 1]
+            if addr & 0x80:
+                skip_count("AY8910 #2")
+            else:
+                events.append(("write", "ay8910", 0, addr, data[pos + 2]))
+                used.add("ay8910")
+            pos += 3
+        elif cmd == 0x61:                   # wait nnnn samples
+            events.append(("wait", struct.unpack_from("<H", data, pos + 1)[0]))
+            pos += 3
+        elif cmd == 0x62:                   # wait 1/60 s
+            events.append(("wait", 735))
+            pos += 1
+        elif cmd == 0x63:                   # wait 1/50 s
+            events.append(("wait", 882))
+            pos += 1
+        elif 0x70 <= cmd <= 0x7F:           # wait n+1 samples
+            events.append(("wait", (cmd & 0x0F) + 1))
+            pos += 1
+        elif 0x80 <= cmd <= 0x8F:           # YM2612 DAC write + wait n
+            skip_count("YM2612 DAC")
+            if cmd & 0x0F:
+                events.append(("wait", cmd & 0x0F))
+            pos += 1
+        elif cmd == 0x67:                   # data block
+            if pos + 7 > end or data[pos + 1] != 0x66:
+                raise VgmError(f"broken data block at 0x{pos:x}")
+            size = u32(data, pos + 3) & 0x7FFFFFFF
+            skip_count("data block")
+            pos += 7 + size
+        elif cmd == 0x68:                   # PCM RAM write
+            skip_count("PCM RAM write")
+            pos += 12
+        else:
+            n = skip_len(cmd)
+            if n is None:
+                raise VgmError(f"unknown VGM command 0x{cmd:02x} at 0x{pos:x}")
+            skip_count(f"cmd 0x{cmd:02x}")
+            pos += n
+    else:
+        print("warning: no end-of-data (0x66) command", file=sys.stderr)
+
+    return events, used, skipped
+
+
+def encode_syncs(n):
+    """Encode n syncs as S98 FF / FE+varint commands."""
+    if n <= 0:
+        return b""
+    if n == 1:
+        return b"\xff"
+    v = n - 2                               # spec: getvv() returns n + 2
+    out = bytearray(b"\xfe")
+    while True:
+        b = v & 0x7F
+        v >>= 7
+        if v:
+            out.append(b | 0x80)
+        else:
+            out.append(b)
+            break
+    return bytes(out)
+
+
+def build_devices(used, hdr):
+    """Return an ordered list of (chip, s98_type, clock)."""
+    devices = []
+    if "ym2608" in used:
+        devices.append(("ym2608", S98_OPNA,
+                        hdr["clock_ym2608"] or DEFAULT_CLOCKS["ym2608"]))
+    if "ym2203" in used:
+        devices.append(("ym2203", S98_OPN,
+                        hdr["clock_ym2203"] or DEFAULT_CLOCKS["ym2203"]))
+    if "ay8910" in used:
+        ay_type = S98_PSG_YM2149 if hdr["ay_type"] == 0x10 else S98_PSG_AY8910
+        devices.append(("ay8910", ay_type,
+                        hdr["clock_ay8910"] or DEFAULT_CLOCKS["ay8910"]))
+    return devices
+
+
+def build_tag(gd3):
+    """Build an [S98] tag (UTF-8 with BOM) from GD3 fields."""
+    if gd3 is None:
+        return b""
+    (track_en, track_jp, game_en, game_jp, system_en, system_jp,
+     author_en, author_jp, date, ripper, _notes) = gd3
+
+    def pick(jp, en):
+        return jp or en
+
+    pairs = [("title", pick(track_jp, track_en)),
+             ("game", pick(game_jp, game_en)),
+             ("artist", pick(author_jp, author_en)),
+             ("system", pick(system_jp, system_en)),
+             ("year", date),
+             ("s98by", ripper),
+             ("comment", "converted by vgm2s98")]
+    body = "".join(f"{k}={v}\x0a" for k, v in pairs if v)
+    return b"[S98]\xef\xbb\xbf" + body.encode("utf-8") + b"\x00"
+
+
+def convert(data, sync_num, sync_den):
+    hdr = parse_header(data)
+    events, used, skipped = parse_commands(data, hdr)
+    if not used:
+        raise VgmError("no supported chip commands (YM2608/YM2203/AY8910)")
+
+    devices = build_devices(used, hdr)
+    dev_index = {chip: i for i, (chip, _, _) in enumerate(devices)}
+
+    dump = bytearray()
+    loop_pos = None
+    total_samples = 0
+    emitted_syncs = 0
+
+    for ev in events:
+        kind = ev[0]
+        if kind == "write":
+            _, chip, port, addr, value = ev
+            dump.append(dev_index[chip] * 2 + port)
+            dump.append(addr)
+            dump.append(value)
+        elif kind == "wait":
+            total_samples += ev[1]
+            target = (total_samples * sync_den
+                      // (VGM_SAMPLE_RATE * sync_num))
+            dump += encode_syncs(target - emitted_syncs)
+            emitted_syncs = target
+        else:                               # loop marker
+            loop_pos = len(dump)
+    dump.append(0xFD)
+
+    dump_ofs = 0x20 + 0x10 * len(devices)
+    tag = build_tag(parse_gd3(data, hdr["gd3_abs"]))
+    tag_ofs = dump_ofs + len(dump) if tag else 0
+    loop_abs = dump_ofs + loop_pos if loop_pos is not None else 0
+
+    out = bytearray()
+    out += b"S983"
+    out += struct.pack("<6L", sync_num, sync_den, 0, tag_ofs, dump_ofs,
+                       loop_abs)
+    out += struct.pack("<L", len(devices))
+    for _, s98_type, clock in devices:
+        out += struct.pack("<4L", s98_type, clock, 0, 0)
+    out += dump
+    out += tag
+
+    stats = {
+        "devices": devices,
+        "skipped": skipped,
+        "seconds": total_samples / VGM_SAMPLE_RATE,
+        "syncs": emitted_syncs,
+        "loop": loop_pos is not None,
+        "size": len(out),
+    }
+    return bytes(out), stats
+
+
+def main():
+    ap = argparse.ArgumentParser(
+        description="Convert VGM (OPNA/OPN/AY portion) to S98 V3")
+    ap.add_argument("input", help="input .vgm or .vgz file")
+    ap.add_argument("output", nargs="?", help="output .s98 file "
+                    "(default: input name with .s98 extension)")
+    ap.add_argument("--sync", default="1/1000", metavar="N/D",
+                    help="S98 sync unit in seconds (default: 1/1000)")
+    ap.add_argument("-q", "--quiet", action="store_true",
+                    help="suppress the conversion summary")
+    args = ap.parse_args()
+
+    try:
+        num, den = (int(x) for x in args.sync.split("/"))
+    except ValueError:
+        ap.error("--sync must look like 1/1000")
+
+    output = args.output
+    if output is None:
+        base = args.input
+        for ext in (".vgm", ".vgz", ".VGM", ".VGZ"):
+            if base.endswith(ext):
+                base = base[:-len(ext)]
+                break
+        output = base + ".s98"
+
+    try:
+        data = read_vgm(args.input)
+        s98, stats = convert(data, num, den)
+    except (VgmError, OSError) as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 1
+
+    with open(output, "wb") as f:
+        f.write(s98)
+
+    if not args.quiet:
+        devs = ", ".join(f"{chip}({clock}Hz)"
+                         for chip, _, clock in stats["devices"])
+        print(f"{output}: {stats['size']} bytes, {stats['seconds']:.1f}s, "
+              f"{stats['syncs']} syncs, devices: {devs}, "
+              f"loop: {'yes' if stats['loop'] else 'no'}")
+        for name, count in sorted(stats["skipped"].items()):
+            print(f"  skipped: {name} x{count}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

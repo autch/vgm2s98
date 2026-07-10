@@ -1,0 +1,59 @@
+# vgm2s98
+
+Convert VGM files to S98 V3 format.
+
+The reverse tool (s982vgm) already exists in the wild; this fills the
+missing direction. The main use case is playing the OPNA/OPN-compatible
+portion of a VGM log on real PC-98 hardware with an S98 player.
+
+## Usage
+
+```
+python3 vgm2s98.py input.vgm [output.s98] [--sync N/D] [-q]
+```
+
+- `.vgz` (gzip-compressed VGM) is read transparently.
+- The output defaults to the input name with an `.s98` extension.
+- `--sync N/D` sets the S98 sync unit in seconds (default `1/1000`).
+
+## What is converted
+
+| VGM command | S98 output |
+|---|---|
+| `0x56`/`0x57` YM2608 port 0/1 | OPNA device, normal/extend (1:1) |
+| `0x55` YM2203 | OPN device (1:1) |
+| `0xA0` AY8910/YM2149 | PSG device (type from the VGM AY chip type) |
+| `0x61`-`0x63`, `0x7n` waits | syncs (`FF`/`FE`+varint) |
+| loop offset | S98 loop point |
+| GD3 tag | `[S98]` tag, UTF-8 with BOM, appended at end of file |
+
+Everything else (YM2612, SN76489, DAC streams, data blocks, second
+chips of a dual-chip pair, ...) is skipped and reported in the
+conversion summary.
+
+## Timing conversion
+
+VGM waits are counted in 1/44100 s samples. They are quantized to the
+S98 sync unit with a running total, so the emitted sync count always
+equals `floor(elapsed_samples * sync_rate / 44100)` — individual events
+may shift by up to half a sync unit, but the error never accumulates.
+
+## Limitations
+
+- No pitch correction: register values are copied verbatim, so if the
+  source chip clock differs from the target hardware clock (e.g. an
+  arcade YM2203 at 3.58 MHz played on a PC-98 at 3.9936 MHz), the pitch
+  shifts accordingly. VGM logs of PC-88/PC-98 origin match and need no
+  correction.
+- YM2612 is not translated to OPNA (planned as a possible future
+  extension together with F-Number rescaling).
+
+## Tests
+
+```
+python3 test/mkvgm.py        # generate synthetic test VGMs
+python3 vgm2s98.py test/scale.vgm
+```
+
+The output can be inspected and round-trip verified with the s98ml
+toolchain (`s98d` / `s98c`).

@@ -1,0 +1,4 @@
+*.s98
+*.vgm
+*.vgz
+__pycache__/
