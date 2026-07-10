@@ -22,6 +22,10 @@ def ym2608(addr, value):
     return bytes([0x56, addr, value])
 
 
+def ym2608_p1(addr, value):
+    return bytes([0x57, addr, value])
+
+
 def wait(samples):
     out = b""
     while samples > 65535:
@@ -36,6 +40,26 @@ def ssg_note(period):
     return ym2608(0x00, period & 0xFF) + ym2608(0x01, (period >> 8) & 0x0F)
 
 
+def deltat_block(start_addr, blob):
+    """VGM data block 0x67 type 0x81 (YM2608 DELTA-T memory image)."""
+    payload = struct.pack("<LL", start_addr + len(blob), start_addr) + blob
+    return bytes([0x67, 0x66, 0x81]) + struct.pack("<L", len(payload)) + payload
+
+
+def adpcm_play(start_addr, length):
+    """Register writes that play a DELTA-T sample from RAM (x8-bit units)."""
+    s = start_addr >> 5
+    e = (start_addr + length - 1) >> 5
+    out = ym2608_p1(0x00, 0x01)             # reset
+    out += ym2608_p1(0x01, 0xC2)            # L+R, x8-bit DRAM
+    out += ym2608_p1(0x02, s & 0xFF) + ym2608_p1(0x03, (s >> 8) & 0xFF)
+    out += ym2608_p1(0x04, e & 0xFF) + ym2608_p1(0x05, (e >> 8) & 0xFF)
+    out += ym2608_p1(0x09, 0x00) + ym2608_p1(0x0A, 0x40)  # DELTA-N
+    out += ym2608_p1(0x0B, 0xFF)            # volume
+    out += ym2608_p1(0x00, 0xA0)            # start, from external memory
+    return out
+
+
 def gd3(title):
     fields = [title, "", "test game", "", "PC-9801", "", "vgm2s98", "",
               "2026", "mkvgm", ""]
@@ -43,8 +67,13 @@ def gd3(title):
     return b"Gd3 " + struct.pack("<LL", 0x100, len(payload)) + payload
 
 
-def build(path, noise=False):
-    intro = ym2608(0x07, 0x3E) + ym2608(0x08, 0x0F)   # SSG tone A only
+def build(path, noise=False, adpcm=False):
+    intro = b""
+    if adpcm:
+        sample = bytes((i * 37) & 0xFF for i in range(1024))
+        intro += deltat_block(0x2000, sample)
+        intro += adpcm_play(0x2000, len(sample))
+    intro += ym2608(0x07, 0x3E) + ym2608(0x08, 0x0F)  # SSG tone A only
     intro += ssg_note(NOTES[0]) + wait(NOTE_SAMPLES)
 
     loop = b""
@@ -59,7 +88,12 @@ def build(path, noise=False):
             loop += wait(NOTE_SAMPLES)
 
     data = intro + loop + b"\x66"
-    tag = gd3("loop test" + (" with noise" if noise else ""))
+    label = "loop test"
+    if noise:
+        label += " with noise"
+    if adpcm:
+        label += " with adpcm"
+    tag = gd3(label)
 
     header = bytearray(0x80)
     header[0:4] = b"Vgm "
@@ -88,3 +122,4 @@ if __name__ == "__main__":
     build(os.path.join(here, "scale.vgm"))
     build(os.path.join(here, "scale.vgz"))
     build(os.path.join(here, "noisy.vgm"), noise=True)
+    build(os.path.join(here, "adpcm.vgm"), adpcm=True)

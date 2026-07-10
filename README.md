@@ -24,12 +24,33 @@ python3 vgm2s98.py input.vgm [output.s98] [--sync N/D] [-q]
 | `0x55` YM2203 | OPN device (1:1) |
 | `0xA0` AY8910/YM2149 | PSG device (type from the VGM AY chip type) |
 | `0x61`-`0x63`, `0x7n` waits | syncs (`FF`/`FE`+varint) |
+| `0x67` type `0x81` DELTA-T memory image | ADPCM RAM upload sequence (see below) |
 | loop offset | S98 loop point |
 | GD3 tag | `[S98]` tag, UTF-8 with BOM, appended at end of file |
 
-Everything else (YM2612, SN76489, DAC streams, data blocks, second
-chips of a dual-chip pair, ...) is skipped and reported in the
+Everything else (YM2612, SN76489, DAC streams, other data blocks,
+second chips of a dual-chip pair, ...) is skipped and reported in the
 conversion summary.
+
+## ADPCM
+
+VGM stores YM2608 ADPCM sample data in data blocks, not as register
+writes, so a register-level conversion alone loses it. vgm2s98
+synthesizes the same upload a PC-98 sound driver performs at load time:
+switch the DELTA-T unit into memory-write mode, set START/STOP/LIMIT,
+then write the sample bytes one register write at a time. One sync is
+inserted every 256 bytes so a real player's interrupt handler is not
+blocked for the whole upload; the added time is absorbed by the
+following waits.
+
+The START/STOP/LIMIT address unit depends on the RAM type (x8-bit DRAM
+or ROM: 32-byte units, x1-bit DRAM: 4-byte units), so the upload adopts
+the RAM type the song itself selects through register $01.
+
+Playing the result on real hardware requires a board whose OPNA has
+DELTA-T RAM (e.g. Speak Board); a plain PC-9801-86 has none, and the
+ADPCM part will stay silent there. Pass `--no-adpcm` to drop the blocks
+and keep the file small.
 
 ## Timing conversion
 

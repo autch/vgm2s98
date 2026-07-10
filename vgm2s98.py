@@ -9,8 +9,16 @@ Supported VGM chips:
   YM2203 (0x55)           -> S98 OPN device, 1:1
   AY8910/YM2149 (0xA0)    -> S98 PSG device
 
-Everything else (YM2612, SN76489, DAC streams, data blocks, ...) is
-skipped; a summary of skipped commands is printed.
+YM2608 DELTA-T data blocks (type 0x81) are converted into an ADPCM RAM
+upload sequence (memory-write mode, then one register write per byte),
+the same thing PC-98 sound drivers do at load time. Playback on real
+hardware therefore requires a board with DELTA-T RAM. The address unit
+of the START/STOP/LIMIT registers depends on the RAM type (x8-bit or
+ROM: 32-byte units; x1-bit: 4-byte units), so the upload uses the same
+RAM type the song itself selects via register $01.
+
+Everything else (YM2612, SN76489, DAC streams, other data blocks, ...)
+is skipped; a summary of skipped commands is printed.
 
 Timing: VGM waits are counted in 44100 Hz samples. They are converted to
 the S98 sync unit (default 1/1000 s) with running-total quantization, so
@@ -142,7 +150,8 @@ def parse_commands(data, hdr):
     """Walk the VGM command stream.
 
     Returns (events, used_chips, skipped) where events is a list of
-    ('write', chip, port, addr, value) / ('wait', samples) / ('loop',).
+    ('write', chip, port, addr, value) / ('wait', samples) / ('loop',) /
+    ('block', start_addr, data) for YM2608 DELTA-T memory images.
     """
     events = []
     used = set()
@@ -199,8 +208,15 @@ def parse_commands(data, hdr):
         elif cmd == 0x67:                   # data block
             if pos + 7 > end or data[pos + 1] != 0x66:
                 raise VgmError(f"broken data block at 0x{pos:x}")
+            btype = data[pos + 2]
             size = u32(data, pos + 3) & 0x7FFFFFFF
-            skip_count("data block")
+            if btype == 0x81 and size > 8:  # YM2608 DELTA-T memory image
+                # payload: dword memory size, dword start address, data
+                start = u32(data, pos + 7 + 4)
+                events.append(("block", start,
+                               data[pos + 7 + 8:pos + 7 + size]))
+            else:
+                skip_count(f"data block type 0x{btype:02x}")
             pos += 7 + size
         elif cmd == 0x68:                   # PCM RAM write
             skip_count("PCM RAM write")
@@ -273,7 +289,7 @@ def build_tag(gd3):
     return b"[S98]\xef\xbb\xbf" + body.encode("utf-8") + b"\x00"
 
 
-def convert(data, sync_num, sync_den):
+def convert(data, sync_num, sync_den, adpcm=True):
     hdr = parse_header(data)
     events, used, skipped = parse_commands(data, hdr)
     if not used:
@@ -282,10 +298,55 @@ def convert(data, sync_num, sync_den):
     devices = build_devices(used, hdr)
     dev_index = {chip: i for i, (chip, _, _) in enumerate(devices)}
 
+    # RAM type for DELTA-T uploads: follow the song's own control2 ($01)
+    # writes so the START/STOP address unit matches (x8-bit/ROM: 32 bytes,
+    # x1-bit: 4 bytes). Default to x8-bit DRAM.
+    ram_type = 0x02
+    for ev in events:
+        if ev[0] == "write" and ev[1] == "ym2608" and ev[2] == 1 \
+                and ev[3] == 0x01:
+            ram_type = ev[4] & 0x03
+            break
+
     dump = bytearray()
     loop_pos = None
     total_samples = 0
     emitted_syncs = 0
+    adpcm_bytes = 0
+
+    def upload_block(start, blob):
+        """Emit a DELTA-T RAM upload as extend-port register writes.
+
+        One sync is inserted every 256 data bytes so a real player's
+        interrupt handler is not blocked for the whole upload; the extra
+        time is absorbed by the following waits (the running-total sync
+        quantization emits correspondingly fewer syncs later).
+        """
+        nonlocal emitted_syncs
+        ext = dev_index["ym2608"] * 2 + 1
+        shift = 5 if ram_type & 0x03 else 2
+
+        def w(addr, value):
+            dump.append(ext)
+            dump.append(addr)
+            dump.append(value)
+
+        w(0x00, 0x01)                       # reset
+        w(0x00, 0x60)                       # memory write mode (REC|MEMDATA)
+        w(0x01, ram_type)
+        unit = start >> shift
+        w(0x02, unit & 0xFF)
+        w(0x03, (unit >> 8) & 0xFF)
+        w(0x04, 0xFF)                       # STOP = max
+        w(0x05, 0xFF)
+        w(0x0C, 0xFF)                       # LIMIT = max
+        w(0x0D, 0xFF)
+        for i, b in enumerate(blob):
+            w(0x08, b)
+            if (i + 1) % 256 == 0:
+                dump.append(0xFF)
+                emitted_syncs += 1
+        w(0x00, 0x00)                       # leave memory mode
 
     for ev in events:
         kind = ev[0]
@@ -299,7 +360,18 @@ def convert(data, sync_num, sync_den):
             target = (total_samples * sync_den
                       // (VGM_SAMPLE_RATE * sync_num))
             dump += encode_syncs(target - emitted_syncs)
-            emitted_syncs = target
+            emitted_syncs = max(emitted_syncs, target)
+        elif kind == "block":
+            _, start, blob = ev
+            if not adpcm:
+                skipped["ADPCM block (disabled)"] = \
+                    skipped.get("ADPCM block (disabled)", 0) + 1
+            elif "ym2608" not in dev_index:
+                skipped["ADPCM block (no YM2608)"] = \
+                    skipped.get("ADPCM block (no YM2608)", 0) + 1
+            else:
+                upload_block(start, blob)
+                adpcm_bytes += len(blob)
         else:                               # loop marker
             loop_pos = len(dump)
     dump.append(0xFD)
@@ -326,6 +398,7 @@ def convert(data, sync_num, sync_den):
         "syncs": emitted_syncs,
         "loop": loop_pos is not None,
         "size": len(out),
+        "adpcm_bytes": adpcm_bytes,
     }
     return bytes(out), stats
 
@@ -338,6 +411,9 @@ def main():
                     "(default: input name with .s98 extension)")
     ap.add_argument("--sync", default="1/1000", metavar="N/D",
                     help="S98 sync unit in seconds (default: 1/1000)")
+    ap.add_argument("--no-adpcm", action="store_true",
+                    help="drop YM2608 DELTA-T data blocks instead of "
+                    "converting them to an ADPCM RAM upload")
     ap.add_argument("-q", "--quiet", action="store_true",
                     help="suppress the conversion summary")
     args = ap.parse_args()
@@ -358,7 +434,7 @@ def main():
 
     try:
         data = read_vgm(args.input)
-        s98, stats = convert(data, num, den)
+        s98, stats = convert(data, num, den, adpcm=not args.no_adpcm)
     except (VgmError, OSError) as e:
         print(f"error: {e}", file=sys.stderr)
         return 1
@@ -372,6 +448,9 @@ def main():
         print(f"{output}: {stats['size']} bytes, {stats['seconds']:.1f}s, "
               f"{stats['syncs']} syncs, devices: {devs}, "
               f"loop: {'yes' if stats['loop'] else 'no'}")
+        if stats["adpcm_bytes"]:
+            print(f"  ADPCM RAM upload: {stats['adpcm_bytes']} bytes "
+                  "(requires DELTA-T RAM on real hardware)")
         for name, count in sorted(stats["skipped"].items()):
             print(f"  skipped: {name} x{count}")
     return 0
