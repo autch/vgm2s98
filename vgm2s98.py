@@ -312,17 +312,20 @@ def convert(data, sync_num, sync_den, adpcm=True):
     loop_pos = None
     total_samples = 0
     emitted_syncs = 0
+    extra_syncs = 0
     adpcm_bytes = 0
 
     def upload_block(start, blob):
         """Emit a DELTA-T RAM upload as extend-port register writes.
 
         One sync is inserted every 256 data bytes so a real player's
-        interrupt handler is not blocked for the whole upload; the extra
-        time is absorbed by the following waits (the running-total sync
-        quantization emits correspondingly fewer syncs later).
+        interrupt handler is not blocked for the whole upload. The
+        inserted syncs extend the timeline (extra_syncs) instead of
+        being absorbed by the following waits: shortening later waits
+        would bake the shortened timing into the loop region, making
+        every loop pass play those waits too fast.
         """
-        nonlocal emitted_syncs
+        nonlocal emitted_syncs, extra_syncs
         ext = dev_index["ym2608"] * 2 + 1
         shift = 5 if ram_type & 0x03 else 2
 
@@ -346,9 +349,35 @@ def convert(data, sync_num, sync_den, adpcm=True):
             if (i + 1) % 256 == 0:
                 dump.append(0xFF)
                 emitted_syncs += 1
+                extra_syncs += 1
         w(0x00, 0x00)                       # leave memory mode
 
+    def do_block(ev):
+        nonlocal adpcm_bytes
+        _, start, blob = ev
+        if not adpcm:
+            skipped["ADPCM block (disabled)"] = \
+                skipped.get("ADPCM block (disabled)", 0) + 1
+        elif "ym2608" not in dev_index:
+            skipped["ADPCM block (no YM2608)"] = \
+                skipped.get("ADPCM block (no YM2608)", 0) + 1
+        else:
+            upload_block(start, blob)
+            adpcm_bytes += len(blob)
+
+    # Hoist data blocks that appear before the first wait to the very
+    # beginning, ahead of the loop marker: a VGM that loops from the top
+    # would otherwise replay the whole RAM upload on every loop pass.
+    body = []
+    seen_wait = False
     for ev in events:
+        if ev[0] == "block" and not seen_wait:
+            do_block(ev)
+        else:
+            seen_wait = seen_wait or ev[0] == "wait"
+            body.append(ev)
+
+    for ev in body:
         kind = ev[0]
         if kind == "write":
             _, chip, port, addr, value = ev
@@ -358,21 +387,12 @@ def convert(data, sync_num, sync_den, adpcm=True):
         elif kind == "wait":
             total_samples += ev[1]
             target = (total_samples * sync_den
-                      // (VGM_SAMPLE_RATE * sync_num))
+                      // (VGM_SAMPLE_RATE * sync_num)) + extra_syncs
             dump += encode_syncs(target - emitted_syncs)
             emitted_syncs = max(emitted_syncs, target)
-        elif kind == "block":
-            _, start, blob = ev
-            if not adpcm:
-                skipped["ADPCM block (disabled)"] = \
-                    skipped.get("ADPCM block (disabled)", 0) + 1
-            elif "ym2608" not in dev_index:
-                skipped["ADPCM block (no YM2608)"] = \
-                    skipped.get("ADPCM block (no YM2608)", 0) + 1
-            else:
-                upload_block(start, blob)
-                adpcm_bytes += len(blob)
-        else:                               # loop marker
+        elif kind == "block":                # mid-stream block (rare)
+            do_block(ev)
+        else:                                # loop marker
             loop_pos = len(dump)
     dump.append(0xFD)
 

@@ -40,8 +40,12 @@ synthesizes the same upload a PC-98 sound driver performs at load time:
 switch the DELTA-T unit into memory-write mode, set START/STOP/LIMIT,
 then write the sample bytes one register write at a time. One sync is
 inserted every 256 bytes so a real player's interrupt handler is not
-blocked for the whole upload; the added time is absorbed by the
-following waits.
+blocked for the whole upload; these syncs extend the timeline (the
+music simply starts a moment later) rather than being deducted from
+later waits, which would bake a rushed passage into the loop region.
+Blocks appearing before the first wait are hoisted ahead of the loop
+point, so a song that loops from the top does not replay the upload on
+every pass.
 
 The START/STOP/LIMIT address unit depends on the RAM type (x8-bit DRAM
 or ROM: 32-byte units, x1-bit DRAM: 4-byte units), so the upload adopts

@@ -67,7 +67,7 @@ def gd3(title):
     return b"Gd3 " + struct.pack("<LL", 0x100, len(payload)) + payload
 
 
-def build(path, noise=False, adpcm=False):
+def build(path, noise=False, adpcm=False, loop_all=False):
     intro = b""
     if adpcm:
         sample = bytes((i * 37) & 0xFF for i in range(1024))
@@ -100,7 +100,8 @@ def build(path, noise=False, adpcm=False):
     struct.pack_into("<L", header, 0x08, 0x00000151)   # version 1.51
     total = SAMPLE_RATE // 4 * 8
     struct.pack_into("<L", header, 0x18, total)        # total samples
-    struct.pack_into("<L", header, 0x1C, 0x80 + len(intro) - 0x1C)  # loop
+    loop_target = 0x80 if loop_all else 0x80 + len(intro)
+    struct.pack_into("<L", header, 0x1C, loop_target - 0x1C)  # loop
     struct.pack_into("<L", header, 0x20, total - NOTE_SAMPLES)
     struct.pack_into("<L", header, 0x34, 0x80 - 0x34)  # data offset
     struct.pack_into("<L", header, 0x48, 7987200)      # YM2608 clock
@@ -123,3 +124,4 @@ if __name__ == "__main__":
     build(os.path.join(here, "scale.vgz"))
     build(os.path.join(here, "noisy.vgm"), noise=True)
     build(os.path.join(here, "adpcm.vgm"), adpcm=True)
+    build(os.path.join(here, "adpcmtop.vgm"), adpcm=True, loop_all=True)
