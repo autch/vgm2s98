@@ -4,7 +4,7 @@ Convert VGM files to S98 V3 format.
 
 The reverse tool (s982vgm) already exists in the wild; this fills the
 missing direction. The main use case is playing the OPNA/OPN-compatible
-portion of a VGM log on real PC-98 hardware with an S98 player.
+portion of a VGM log on real PC-98 hardware with an [S98 player](https://github.com/autch/s98play-plus).
 
 ## Usage
 
@@ -80,5 +80,5 @@ python3 test/mkvgm.py        # generate synthetic test VGMs
 python3 vgm2s98.py test/scale.vgm
 ```
 
-The output can be inspected and round-trip verified with the s98ml
-toolchain (`s98d` / `s98c`).
+The output can be inspected and round-trip verified with the [s98ml
+toolchain](https://github.com/autch/s98ml) (`s98d` / `s98c`).
