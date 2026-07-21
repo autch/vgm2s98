@@ -73,6 +73,45 @@ may shift by up to half a sync unit, but the error never accumulates.
 - YM2612 is not translated to OPNA (planned as a possible future
   extension together with F-Number rescaling).
 
+## C port (`src/`)
+
+A C89 port of `vgm2s98.py` lives under `src/`. With the default host
+build the `.s98` dump is byte-identical to the Python output (including
+the GD3-derived `[S98]` tag). The design streams the VGM command stream
+in two seekable passes and avoids `long long`, so the same sources are
+intended for 16-bit DOS compilers (e.g. LSI C-86, Microsoft C) as well
+as modern gcc.
+
+### Host (gcc)
+
+```
+cd src
+make                 # default: zlib + GD3 tag conversion
+make ZLIB=0 GD3=0    # slim build; same feature set as the DOS target
+```
+
+### PC-98 DOS
+
+Build without optional bulk so the binary stays small and free of
+floating-point and compression libraries:
+
+| Macro / switch | Effect |
+|---|---|
+| no `HAVE_ZLIB` (`ZLIB=0`) | no `.vgz`; decompress on the host and pass a plain `.vgm` |
+| no `HAVE_GD3` (`GD3=0`) | no GD3 → `[S98]` tag |
+
+GD3 → `[S98]` needs UTF-16LE decoding, UTF-8 encoding, and a heap
+buffer for the tag. On a DOS-sized binary that cost is not worth it
+(UTF-8 tags also sit poorly on a Shift_JIS environment), so the DOS
+build simply leaves `tag_ofs` at zero. Stats printing uses integer
+seconds only (no `printf` `%f`), which lets LSI C link with **intlib**
+instead of a floating-point library.
+
+`src/Makefile` is a GNU make / host-gcc recipe only. Makefiles for LSI C
+or Microsoft C differ substantially and are not covered here (write them
+for the toolchain you use; define or omit `HAVE_ZLIB` / `HAVE_GD3` as
+above).
+
 ## Tests
 
 ```
