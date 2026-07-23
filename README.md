@@ -78,39 +78,44 @@ may shift by up to half a sync unit, but the error never accumulates.
 A C89 port of `vgm2s98.py` lives under `src/`. With the default host
 build the `.s98` dump is byte-identical to the Python output (including
 the GD3-derived `[S98]` tag). The design streams the VGM command stream
-in two seekable passes and avoids `long long`, so the same sources are
-intended for 16-bit DOS compilers (e.g. LSI C-86, Microsoft C) as well
-as modern gcc.
+in two seekable passes and avoids `long long`, so the same sources build
+with modern gcc, DJGPP, and 16-bit DOS compilers (LSI C-86 verified).
 
-### Host (gcc)
+Conversion has been checked with:
+
+- **gcc / DJGPP** — `src/Makefile` (output matches the Python tool)
+- **LSI C-86** — `src/Makefile.lsi` (converts on real PC-98 DOS)
+
+### Host and DJGPP (`src/Makefile`)
+
+GNU make. Works for native Linux/macOS gcc and for DJGPP on DOS.
 
 ```
 cd src
 make                 # default: zlib + GD3 tag conversion
-make ZLIB=0 GD3=0    # slim build; same feature set as the DOS target
+make ZLIB=0 GD3=0    # slim build; same feature set as the 16-bit DOS target
 ```
 
-### PC-98 DOS
+### 16-bit DOS / LSI C-86 (`src/Makefile.lsi`)
 
-Build without optional bulk so the binary stays small and free of
-floating-point and compression libraries:
+```
+cd src
+make -f Makefile.lsi
+```
 
-| Macro / switch | Effect |
+Neither `HAVE_ZLIB` nor `HAVE_GD3` is defined, so the binary stays small
+and free of compression and floating-point libraries:
+
+| Macro | Effect when undefined |
 |---|---|
-| no `HAVE_ZLIB` (`ZLIB=0`) | no `.vgz`; decompress on the host and pass a plain `.vgm` |
-| no `HAVE_GD3` (`GD3=0`) | no GD3 → `[S98]` tag |
+| `HAVE_ZLIB` | no `.vgz`; decompress on the host and pass a plain `.vgm` |
+| `HAVE_GD3` | no GD3 → `[S98]` tag (`tag_ofs` stays 0) |
 
 GD3 → `[S98]` needs UTF-16LE decoding, UTF-8 encoding, and a heap
 buffer for the tag. On a DOS-sized binary that cost is not worth it
-(UTF-8 tags also sit poorly on a Shift_JIS environment), so the DOS
-build simply leaves `tag_ofs` at zero. Stats printing uses integer
-seconds only (no `printf` `%f`), which lets LSI C link with **intlib**
-instead of a floating-point library.
-
-`src/Makefile` is a GNU make / host-gcc recipe only. Makefiles for LSI C
-or Microsoft C differ substantially and are not covered here (write them
-for the toolchain you use; define or omit `HAVE_ZLIB` / `HAVE_GD3` as
-above).
+(UTF-8 tags also sit poorly on a Shift_JIS environment). Stats printing
+uses integer seconds only (no `printf` `%f`), so LSI C can link with
+**intlib** instead of a floating-point library.
 
 ## Tests
 

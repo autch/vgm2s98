@@ -1,0 +1,21 @@
+# Makefile for LSI C-86 (16-bit DOS). No HAVE_ZLIB / HAVE_GD3.
+#   make -f Makefile.lsi
+
+OBJS = main.obj errmsg.obj vgm.obj s98.obj convert.obj
+
+vgm2s98.exe: $(OBJS)
+	lcc -o $@ $(OBJS) $(LDLIBS)
+
+$(OBJS): vgm2s98.h
+main.obj: vgm.h s98.h convert.h
+convert.obj: vgm.h s98.h convert.h
+vgm.obj: vgm.h
+s98.obj: s98.h
+
+# command.com del does not take multiple filenames; use a wildcard.
+clean:
+	del vgm2s98.exe
+	del *.obj
+
+.PHONY: clean
+

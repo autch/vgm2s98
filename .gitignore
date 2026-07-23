@@ -2,5 +2,8 @@
 *.vgm
 *.vgz
 *.o
+*.obj
 __pycache__/
 src/vgm2s98
+src/vgm2s98.exe
+

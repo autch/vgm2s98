@@ -1,7 +1,8 @@
-# gcc / host build.  For a PC-98 DOS binary, omit optional bulk:
+# GNU make for host gcc or DJGPP. Slim / 16-bit-like feature set:
 #   make ZLIB=0 GD3=0
 # ZLIB=0  no .vgz (no zlib); decompress on the host first
 # GD3=0   no GD3 -> [S98] tag (conversion cost not worth it on DOS)
+# LSI C-86: see Makefile.lsi
 CC = gcc
 CFLAGS = -std=c89 -pedantic -Wall -Wextra -O2
 ZLIB ?= 1
